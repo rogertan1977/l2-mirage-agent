@@ -1,0 +1,74 @@
+# L2 Mirage Agent 配置范例：复制为 l2_config.yaml 再按需修改（l2_config.yaml 含 Telegram token，已建议加入 .gitignore）
+#   cp l2_config.example.yaml l2_config.yaml
+# 只支持两层结构（section: key: value）；若已安装 PyYAML 则使用完整 YAML 解析。
+# 默认文件名是 l2_config.yaml（而不是 config.yaml），这样可以和 PanicDip 的 config.yaml 放在同一目录而不冲突。
+
+streams:
+  symbols: "BTCUSDT,ETHUSDT,SOLUSDT"          # 逗号分隔。每个币种 = 1 路深度流 + 1 路成交流 (+ 1 路心跳)
+  # 2026 年起币安把 USDⓈ-M WS 拆成 /public /market /private。depth 在 /public，aggTrade 在 /market，
+  # 所以本程序同时维持【两条独立连接】。若币安再次调整路径，只需改这里。
+  public_ws: "wss://fstream.binance.com/public"
+  market_ws: "wss://fstream.binance.com/market"
+  depth_levels: 20                            # 5 / 10 / 20
+  depth_speed: "100ms"                        # 100ms / 250ms / 500ms
+  # 订阅 <symbol>@markPrice@1s 作为 /market 端点的心跳：即使某个币种长时间没有成交，也能持续测得 /market 的延迟
+  heartbeat_markprice: true
+  stall_seconds: 20                           # 连接上超过这么久没有任何数据 -> 判定卡死并重连
+  backoff_min: 1                              # 重连退避（秒）：指数增长，带 ±20% 抖动
+  backoff_max: 60
+
+sync:
+  # ---- 两个流的时间对齐（见 README「竞态处理」）----
+  agg_slack_ms: 150          # aggTrade 每 100ms 聚合一次，成交归因的时间窗两侧各放宽这么多
+  base_wait_ms: 250          # 撤单被确认后，至少再等这么久才判定「有没有对应成交」（覆盖聚合延迟）
+  skew_margin: 1.25          # 实际等待 = base_wait + 估计的 /market 相对 /public 的延迟偏差 * margin
+  max_wait_ms: 2500          # 需要等待的时间超过它 -> 偏差太大，无法可靠核对成交，【暂停虚假挂单侦测】（宁可漏报）
+  min_latency_samples: 15    # 延迟样本数不足时（刚启动）同样不判定
+  resync_quiet_ms: 3000      # 任一连接重连后，这段时间内的判定一律作废
+  max_loop_lag_ms: 300       # 本机事件循环自己落后超过这么多（CPU 被占满）-> 暂停判定 2 秒
+
+spoof:                       # 侦测器 A：虚假挂单撤离（疑似 Spoofing）
+  enabled: true
+  wall_min_notional_usd: 1_000_000            # 「大额墙」的最小名义价值（美元）。比固定币数更可跨币种比较
+  wall_min_notional_overrides: ""             # 单币种覆盖，例如 "BTCUSDT:3000000,SOLUSDT:300000"
+  max_distance_pct: 0.2                       # 墙距现价不超过 0.2% 才算（重要：见下方说明）
+  near_pct: 0.05                              # 距现价 <= 0.05% 视为「已逼近」；
+  approach_frac: 0.7                          # 或者：当前距离 <= 墙刚出现时距离的 70%（价格正在靠近它）
+  min_wall_age_ms: 700                        # 墙至少存在这么久才算「墙」（过滤一闪而过的噪音）
+  shrink_min_ratio: 0.8                       # 缩减比例 >= 80%
+  shrink_window_ms: 300                       # 且发生在 <= 300ms 内（深度流 100ms 一帧，所以是 1~3 帧）
+  confirm_ms: 100                             # 缩减状态必须持续到下一帧才确认（过滤数据毛刺 / 瞬间闪烁）
+  max_fill_ratio: 0.2                         # 对应成交（恰在墙价位的主动单）不得超过消失数量的 20%
+  max_replaced_ratio: 0.5                     # 同侧可见深度里「被补回来」的比例不得超过 50%（否则只是挪了位置，不是真空）
+  cooldown_seconds: 30                        # 同一币种、同一方向两次警报的最短间隔
+  # ⚠️ depth20 只含「最靠近现价的 20 档」。BTCUSDT 这类最小跳动单位极小的合约，20 档可能只覆盖 ~0.003% 的价格区间，
+  #    0.2% 以外的墙在这个流里根本看不见。启动后约 12 秒日志会打印每个币种的「可见深度跨度」，请据此选币。
+
+iceberg:                     # 侦测器 B：冰山吸筹（疑似）
+  enabled: true
+  window_seconds: 60                          # 滚动窗口：1 分钟
+  min_taker_notional_usd: 10_000_000          # 窗口内砸向【同一价位】的主动成交累计名义价值（≈ 160 BTC @ 6.2 万）
+  min_taker_notional_overrides: ""             # 单币种覆盖，例如 "BTCUSDT:12000000,SOLUSDT:2000000"
+  watch_fraction: 0.3                         # 累计达到阈值的 30% 后，开始记录该价位的可见挂单量
+  min_samples: 8                              # 至少采样这么多帧可见挂单量后才评估（100ms 一帧）
+  min_turnover: 5.0                           # 该价位成交量 / 可见挂单量（中位）>= 5：说明被补单 4 次以上
+  min_retention: 0.5                          # 当前可见量 / 中位可见量 >= 50%：盘口没被吃穿
+  hold_tolerance_pct: 0.01                    # 价格守住：开始被吃以来，没有比该价位更差 0.01% 的同向成交
+  max_distance_pct: 0.1                       # 该价位距现价不超过 0.1%（已远离的价位不再相关）
+  cooldown_seconds: 300
+
+storage:
+  path: l2_mirage.db                          # 只记录触发的事件（SQLite WAL），不存任何 tick
+  retention_days: 30
+
+telegram:
+  enabled: false
+  # 向 @BotFather 建立机器人取得 token；chat_id 见 getUpdates。群组 ID 通常以 -100 开头。
+  # 安全提醒：请勿把真实 token 提交到 Git。建议改用环境变量（优先于本文件）：
+  #   L2MIRAGE_TG_TOKEN / L2MIRAGE_TG_CHAT_ID    （未设置时也会读取 PANICDIP_TG_TOKEN / PANICDIP_TG_CHAT_ID）
+  bot_token: "YOUR_BOT_TOKEN"
+  chat_id: "YOUR_CHAT_ID"
+  timeout_seconds: 10
+
+logging:
+  level: INFO

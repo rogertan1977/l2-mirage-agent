@@ -1,0 +1,11 @@
+# L2 Mirage Agent: never commit secrets or local data
+l2_config.yaml
+config.yaml
+*.db
+*.db-wal
+*.db-shm
+
+.venv/
+venv/
+__pycache__/
+*.pyc
